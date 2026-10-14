@@ -16,6 +16,7 @@ jobs:
         run: |
           python3 - << 'EOF'
           import os
+          import textwrap
 
           FILES = {
               "settings.gradle.kts": r"""pluginManagement {
@@ -66,7 +67,7 @@ jobs:
                   minSdk = 26
                   targetSdk = 34
                   versionCode = 1
-                  versionName = "1.0"
+                  versionName = "1.1"
 
                   ndk {
                       abiFilters += listOf("arm64-v8a", "x86_64")
@@ -185,7 +186,7 @@ jobs:
 
           def is_auth_error(msg):
               m = msg.lower()
-              triggers = ["login required", "sign in", "401", "403", "private", "cookies", "authentication", "rate-limit"]
+              triggers = ["login required", "sign in", "401", "403", "private", "cookies", "authentication", "rate-limit", " redirect "]
               return any(t in m for t in triggers)
           """,
 
@@ -245,6 +246,7 @@ jobs:
           import android.os.Bundle
           import android.os.Environment
           import android.webkit.CookieManager
+          import android.webkit.WebResourceRequest
           import android.webkit.WebView
           import android.webkit.WebViewClient
           import androidx.activity.ComponentActivity
@@ -320,6 +322,17 @@ jobs:
                   "OmniGrab"
               )
 
+              fun resolveLoginUrl(targetUrl: String): String {
+                  val lower = targetUrl.lowercase()
+                  return when {
+                      "instagram.com" in lower -> "https://www.instagram.com/accounts/login/"
+                      "tiktok.com" in lower -> "https://www.tiktok.com/login"
+                      "x.com" in lower || "twitter.com" in lower -> "https://x.com/i/flow/login"
+                      targetUrl.isNotBlank() -> targetUrl
+                      else -> "https://www.instagram.com/accounts/login/"
+                  }
+              }
+
               fun startDownload() {
                   if (url.isBlank()) return
                   isDownloading = true
@@ -338,7 +351,7 @@ jobs:
                               statusText = "Success (${res.getString("engine")}): Saved to Downloads/OmniGrab"
                           }
                           "auth_required" -> {
-                              statusText = "Authentication required! Please log in below and tap 'Save Cookies & Retry'."
+                              statusText = "Authentication required! Log in below, then tap 'Save Login Cookies & Retry'."
                               showAuthWebView = true
                           }
                           else -> {
@@ -408,8 +421,20 @@ jobs:
                                   settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
                                   CookieManager.getInstance().setAcceptCookie(true)
                                   CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                                  webViewClient = WebViewClient()
-                                  loadUrl(url.ifBlank { "https://www.instagram.com/accounts/login/" })
+                                  webViewClient = object : WebViewClient() {
+                                      override fun shouldOverrideUrlLoading(
+                                          view: WebView?,
+                                          request: WebResourceRequest?
+                                      ): Boolean {
+                                          val scheme = request?.url?.scheme?.lowercase() ?: return false
+                                          if (scheme == "http" || scheme == "https") {
+                                              return false
+                                          }
+                                          // Block custom deep-link schemes like instagram:// or intent://
+                                          return true
+                                      }
+                                  }
+                                  loadUrl(resolveLoginUrl(url))
                               }
                           }
                       )
@@ -419,7 +444,6 @@ jobs:
           """
           }
 
-          import textwrap
           for path, content in FILES.items():
               os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
               with open(path, "w", encoding="utf-8") as f:
