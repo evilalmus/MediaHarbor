@@ -1,0 +1,448 @@
+name: Generate and Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Android Project via Python
+        run: |
+          python3 - << 'EOF'
+          import os
+
+          FILES = {
+              "settings.gradle.kts": r"""pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+                  maven { url = uri("https://chaquo.com/maven") }
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://chaquo.com/maven") }
+              }
+          }
+          rootProject.name = "OmniGrab"
+          include(":app")
+          """,
+
+              "build.gradle.kts": r"""plugins {
+              id("com.android.application") version "8.3.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+              id("com.chaquo.python") version "15.0.1" apply false
+          }
+          """,
+
+              "gradle.properties": r"""org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          """,
+
+              "app/build.gradle.kts": r"""plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("com.chaquo.python")
+          }
+
+          android {
+              namespace = "com.local.omnigrab"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.local.omnigrab"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+
+                  ndk {
+                      abiFilters += listOf("arm64-v8a", "x86_64")
+                  }
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.10"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          chaquopy {
+              defaultConfig {
+                  version = "3.11"
+                  pip {
+                      install("yt-dlp")
+                      install("gallery-dl")
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.activity:activity-compose:1.8.2")
+              implementation(platform("androidx.compose:compose-bom:2024.02.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+          }
+          """,
+
+              "app/src/main/AndroidManifest.xml": r"""<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="OmniGrab"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          """,
+
+              "app/src/main/python/downloader.py": r"""import os
+          import json
+          import yt_dlp
+          import gallery_dl
+          from gallery_dl import config, job
+
+          def download_media(url, output_dir, cookie_file=None):
+              os.makedirs(output_dir, exist_ok=True)
+              
+              ydl_opts = {
+                  'outtmpl': os.path.join(output_dir, '%(extractor)s_%(id)s.%(ext)s'),
+                  'quiet': True,
+                  'no_warnings': True,
+                  'format': 'best[ext=mp4]/best',
+              }
+              if cookie_file and os.path.exists(cookie_file) and os.path.getsize(cookie_file) > 0:
+                  ydl_opts['cookiefile'] = cookie_file
+
+              try:
+                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                      ydl.download([url])
+                  return json.dumps({"status": "success", "engine": "yt-dlp", "message": "Downloaded video to " + output_dir})
+              except Exception as e:
+                  err_msg = str(e)
+                  if is_auth_error(err_msg):
+                      return json.dumps({"status": "auth_required", "message": err_msg})
+
+                  try:
+                      config.clear()
+                      config.set(("extractor",), "base-directory", output_dir)
+                      if cookie_file and os.path.exists(cookie_file) and os.path.getsize(cookie_file) > 0:
+                          config.set(("extractor",), "cookies", cookie_file)
+                      
+                      dl_job = job.DownloadJob(url)
+                      status = dl_job.run()
+                      if status == 0:
+                          return json.dumps({"status": "success", "engine": "gallery-dl", "message": "Downloaded media to " + output_dir})
+                      else:
+                          return json.dumps({"status": "auth_required", "message": "Gallery extraction failed; login may be required."})
+                  except Exception as ge:
+                      g_err = str(ge)
+                      if is_auth_error(g_err):
+                          return json.dumps({"status": "auth_required", "message": g_err})
+                      return json.dumps({"status": "error", "message": f"yt-dlp: {err_msg}\ngallery-dl: {g_err}"})
+
+          def is_auth_error(msg):
+              m = msg.lower()
+              triggers = ["login required", "sign in", "401", "403", "private", "cookies", "authentication", "rate-limit"]
+              return any(t in m for t in triggers)
+          """,
+
+              "app/src/main/java/com/local/omnigrab/CookieBridge.kt": r"""package com.local.omnigrab
+
+          import android.webkit.CookieManager
+          import java.io.File
+          import java.net.URI
+
+          object CookieBridge {
+              private val trackedDomains = mutableSetOf(
+                  "https://www.instagram.com",
+                  "https://www.tiktok.com",
+                  "https://x.com",
+                  "https://twitter.com",
+                  "https://www.youtube.com",
+                  "https://www.reddit.com"
+              )
+
+              fun exportToNetscapeFile(targetUrl: String, cookieFile: File) {
+                  val cookieManager = CookieManager.getInstance()
+                  cookieManager.flush()
+
+                  runCatching {
+                      val uri = URI(targetUrl)
+                      if (uri.scheme != null && uri.host != null) {
+                          trackedDomains.add("${uri.scheme}://${uri.host}")
+                      }
+                  }
+
+                  val sb = StringBuilder("# Netscape HTTP Cookie File\n")
+                  val expiry = (System.currentTimeMillis() / 1000) + 31536000L
+
+                  for (domainUrl in trackedDomains) {
+                      val rawCookies = cookieManager.getCookie(domainUrl) ?: continue
+                      val host = URI(domainUrl).host.removePrefix("www.")
+                      val pairs = rawCookies.split(";")
+                      for (pair in pairs) {
+                          val parts = pair.trim().split("=", limit = 2)
+                          if (parts.size == 2) {
+                              val name = parts[0].trim()
+                              val value = parts[1].trim()
+                              sb.append(".${host}\tTRUE\t/\tTRUE\t$expiry\t$name\t$value\n")
+                          }
+                      }
+                  }
+                  cookieFile.writeText(sb.toString())
+              }
+          }
+          """,
+
+              "app/src/main/java/com/local/omnigrab/MainActivity.kt": r"""package com.local.omnigrab
+
+          import android.annotation.SuppressLint
+          import android.content.Intent
+          import android.media.MediaScannerConnection
+          import android.os.Bundle
+          import android.os.Environment
+          import android.webkit.CookieManager
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import com.chaquo.python.Python
+          import com.chaquo.python.android.AndroidPlatform
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONObject
+          import java.io.File
+
+          class MainActivity : ComponentActivity() {
+              private var sharedUrlState = mutableStateOf("")
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (!Python.isStarted()) {
+                      Python.start(AndroidPlatform(this))
+                  }
+                  handleShareIntent(intent)
+
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(modifier = Modifier.fillMaxSize()) {
+                              DownloaderApp(
+                                  initialUrl = sharedUrlState.value,
+                                  cookieFile = File(filesDir, "cookies.txt"),
+                                  onScanMedia = { dir -> scanDirectory(dir) }
+                              )
+                          }
+                      }
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  handleShareIntent(intent)
+              }
+
+              private fun handleShareIntent(intent: Intent?) {
+                  if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
+                      intent.getStringExtra(Intent.EXTRA_TEXT)?.let { rawText ->
+                          val urlRegex = "(https?://\\S+)".toRegex()
+                          sharedUrlState.value = urlRegex.find(rawText)?.value ?: rawText
+                      }
+                  }
+              }
+
+              private fun scanDirectory(dir: File) {
+                  val paths = dir.listFiles()?.map { it.absolutePath }?.toTypedArray() ?: return
+                  MediaScannerConnection.scanFile(this, paths, null, null)
+              }
+          }
+
+          @SuppressLint("SetJavaScriptEnabled")
+          @Composable
+          fun DownloaderApp(initialUrl: String, cookieFile: File, onScanMedia: (File) -> Unit) {
+              var url by remember(initialUrl) { mutableStateOf(initialUrl) }
+              var statusText by remember { mutableStateOf("Ready. Paste a link or Share from any app.") }
+              var isDownloading by remember { mutableStateOf(false) }
+              var showAuthWebView by remember { mutableStateOf(false) }
+              val scope = rememberCoroutineScope()
+
+              val outputDir = File(
+                  Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                  "OmniGrab"
+              )
+
+              fun startDownload() {
+                  if (url.isBlank()) return
+                  isDownloading = true
+                  statusText = "Downloading media locally..."
+                  scope.launch {
+                      val resultJson = withContext(Dispatchers.IO) {
+                          val py = Python.getInstance()
+                          val module = py.getModule("downloader")
+                          module.callAttr("download_media", url.trim(), outputDir.absolutePath, cookieFile.absolutePath).toString()
+                      }
+                      isDownloading = false
+                      val res = JSONObject(resultJson)
+                      when (res.getString("status")) {
+                          "success" -> {
+                              onScanMedia(outputDir)
+                              statusText = "Success (${res.getString("engine")}): Saved to Downloads/OmniGrab"
+                          }
+                          "auth_required" -> {
+                              statusText = "Authentication required! Please log in below and tap 'Save Cookies & Retry'."
+                              showAuthWebView = true
+                          }
+                          else -> {
+                              statusText = "Error: ${res.getString("message")}"
+                          }
+                      }
+                  }
+              }
+
+              LaunchedEffect(initialUrl) {
+                  if (initialUrl.isNotBlank()) {
+                      startDownload()
+                  }
+              }
+
+              Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+                  Text("OmniGrab Local Downloader", style = MaterialTheme.typography.headlineSmall)
+                  Spacer(modifier = Modifier.height(12.dp))
+
+                  OutlinedTextField(
+                      value = url,
+                      onValueChange = { url = it },
+                      label = { Text("Media URL (Instagram, TikTok, X, YouTube...)") },
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true
+                  )
+
+                  Spacer(modifier = Modifier.height(12.dp))
+
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(
+                          onClick = { startDownload() },
+                          enabled = !isDownloading && url.isNotBlank(),
+                          modifier = Modifier.weight(1f)
+                      ) {
+                          Text(if (isDownloading) "Working..." else "Download")
+                      }
+
+                      OutlinedButton(onClick = { showAuthWebView = !showAuthWebView }) {
+                          Text(if (showAuthWebView) "Hide Login" else "Web Login")
+                      }
+                  }
+
+                  Spacer(modifier = Modifier.height(12.dp))
+                  Text(statusText, style = MaterialTheme.typography.bodyMedium)
+
+                  if (showAuthWebView) {
+                      Spacer(modifier = Modifier.height(12.dp))
+                      Button(
+                          onClick = {
+                              CookieBridge.exportToNetscapeFile(url, cookieFile)
+                              showAuthWebView = false
+                              startDownload()
+                          },
+                          modifier = Modifier.fillMaxWidth()
+                      ) {
+                          Text("Save Login Cookies & Retry Download")
+                      }
+                      Spacer(modifier = Modifier.height(8.dp))
+
+                      AndroidView(
+                          modifier = Modifier.fillMaxSize(),
+                          factory = { ctx ->
+                              WebView(ctx).apply {
+                                  settings.javaScriptEnabled = true
+                                  settings.domStorageEnabled = true
+                                  settings.userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
+                                  CookieManager.getInstance().setAcceptCookie(true)
+                                  CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                                  webViewClient = WebViewClient()
+                                  loadUrl(url.ifBlank { "https://www.instagram.com/accounts/login/" })
+                              }
+                          }
+                      )
+                  }
+              }
+          }
+          """
+          }
+
+          import textwrap
+          for path, content in FILES.items():
+              os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(textwrap.dedent(content).strip() + "\n")
+          print("All project files generated and dedented successfully!")
+          EOF
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniGrab-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
