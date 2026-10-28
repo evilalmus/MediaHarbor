@@ -66,8 +66,8 @@ jobs:
                   applicationId = "com.local.omnigrab"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 3
-                  versionName = "1.3"
+                  versionCode = 4
+                  versionName = "1.4"
 
                   ndk {
                       abiFilters += listOf("arm64-v8a", "x86_64")
@@ -105,6 +105,7 @@ jobs:
               implementation("androidx.activity:activity-compose:1.8.2")
               implementation(platform("androidx.compose:compose-bom:2024.02.00"))
               implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
               implementation("androidx.compose.material3:material3")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
           }
@@ -160,7 +161,6 @@ jobs:
               return dl_job.run()
 
           def try_ig_embed_fallback(url, output_dir):
-              # Extracts images/videos from public Instagram posts via the embed endpoint without needing login
               m = re.search(r'instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
               if not m:
                   return False
@@ -173,7 +173,6 @@ jobs:
               if r.status_code != 200:
                   return False
               
-              # Look for EmbeddedMediaImage high-res src URLs in the embed HTML
               matches = re.findall(r'class="EmbeddedMediaImage"[^>]+src="([^"]+)"', r.text)
               if not matches:
                   matches = re.findall(r'"display_url"\s*:\s*"([^"]+)"', r.text)
@@ -191,11 +190,9 @@ jobs:
 
           def download_media(url, output_dir, cookie_file=None):
               os.makedirs(output_dir, exist_ok=True)
-              # Clean tracking query params from Instagram links (?igsh=...)
               clean_url = re.sub(r'\?igsh=[^&]+.*$', '', url.strip())
               has_cookies = bool(cookie_file and os.path.exists(cookie_file) and os.path.getsize(cookie_file) > 60)
 
-              # If it's an Instagram /p/ post, try gallery-dl and embed fallback first before yt-dlp
               if "instagram.com/p/" in clean_url.lower():
                   try:
                       if run_gallery_dl(clean_url, output_dir, cookie_file, has_cookies) == 0:
@@ -208,7 +205,6 @@ jobs:
                   except Exception:
                       pass
 
-              # 1. Try yt-dlp (Videos, Reels, TikToks, Shorts)
               ydl_opts = {
                   'outtmpl': os.path.join(output_dir, '%(extractor)s_%(id)s.%(ext)s'),
                   'quiet': True,
@@ -226,7 +222,6 @@ jobs:
               except Exception as e:
                   yt_err = str(e)
 
-              # 2. Fallback to gallery-dl + ig-embed
               try:
                   status = run_gallery_dl(clean_url, output_dir, cookie_file, has_cookies)
                   if status == 0:
@@ -307,8 +302,13 @@ jobs:
 
           import android.annotation.SuppressLint
           import android.content.Intent
-          import android.graphics.Color
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Color as AndroidColor
+          import android.media.MediaMetadataRetriever
           import android.media.MediaScannerConnection
+          import android.media.ThumbnailUtils
+          import android.net.Uri
           import android.os.Bundle
           import android.os.Environment
           import android.view.ViewGroup
@@ -316,14 +316,31 @@ jobs:
           import android.webkit.WebResourceRequest
           import android.webkit.WebView
           import android.webkit.WebViewClient
+          import android.widget.MediaController
+          import android.widget.VideoView
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
           import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.compose.ui.window.Dialog
+          import androidx.compose.ui.window.DialogProperties
           import com.chaquo.python.Python
           import com.chaquo.python.android.AndroidPlatform
           import kotlinx.coroutines.Dispatchers
@@ -370,24 +387,47 @@ jobs:
               }
 
               private fun scanDirectory(dir: File) {
-                  val paths = dir.listFiles()?.map { it.absolutePath }?.toTypedArray() ?: return
-                  MediaScannerConnection.scanFile(this, paths, null, null)
+                  val paths = dir.walkTopDown().filter { it.isFile }.map { it.absolutePath }.toList().toTypedArray()
+                  if (paths.isNotEmpty()) {
+                      MediaScannerConnection.scanFile(this, paths, null, null)
+                  }
               }
+          }
+
+          fun isVideoFile(file: File): Boolean {
+              return file.extension.lowercase() in listOf("mp4", "mkv", "webm", "mov")
+          }
+
+          fun loadMediaFiles(dir: File): List<File> {
+              if (!dir.exists()) return emptyList()
+              val allowed = setOf("jpg", "jpeg", "png", "webp", "gif", "mp4", "mkv", "webm", "mov")
+              return dir.walkTopDown()
+                  .filter { it.isFile && it.extension.lowercase() in allowed }
+                  .sortedByDescending { it.lastModified() }
+                  .toList()
           }
 
           @SuppressLint("SetJavaScriptEnabled")
           @Composable
           fun DownloaderApp(initialUrl: String, cookieFile: File, onScanMedia: (File) -> Unit) {
+              val outputDir = remember {
+                  File(
+                      Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                      "OmniGrab"
+                  )
+              }
+
               var url by remember(initialUrl) { mutableStateOf(initialUrl) }
-              var statusText by remember { mutableStateOf("Ready (v1.3). Paste a link or Share from any app.") }
+              var statusText by remember { mutableStateOf("Ready (v1.4). Paste a link or Share from any app.") }
               var isDownloading by remember { mutableStateOf(false) }
               var showAuthWebView by remember { mutableStateOf(false) }
+              var mediaFiles by remember { mutableStateOf(loadMediaFiles(outputDir)) }
+              var selectedFile by remember { mutableStateOf<File?>(null) }
               val scope = rememberCoroutineScope()
 
-              val outputDir = File(
-                  Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                  "OmniGrab"
-              )
+              fun refreshGallery() {
+                  mediaFiles = loadMediaFiles(outputDir)
+              }
 
               fun resolveLoginUrl(targetUrl: String): String {
                   val lower = targetUrl.lowercase()
@@ -416,10 +456,11 @@ jobs:
                       when (res.getString("status")) {
                           "success" -> {
                               onScanMedia(outputDir)
-                              statusText = "Success (${res.getString("engine")}): Saved to Downloads/OmniGrab"
+                              refreshGallery()
+                              statusText = "Success (${res.getString("engine")}): Added to gallery below!"
                           }
                           "auth_required" -> {
-                              statusText = "v1.3 Auth needed ($cookieCount cookies). Sign in below & tap Save."
+                              statusText = "v1.4 Auth needed ($cookieCount cookies). Sign in below & tap Save."
                               showAuthWebView = true
                           }
                           else -> {
@@ -430,14 +471,15 @@ jobs:
               }
 
               LaunchedEffect(initialUrl) {
+                  refreshGallery()
                   if (initialUrl.isNotBlank()) {
                       startDownload()
                   }
               }
 
               Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                  Text("OmniGrab v1.3", style = MaterialTheme.typography.headlineSmall)
-                  Spacer(modifier = Modifier.height(12.dp))
+                  Text("OmniGrab v1.4", style = MaterialTheme.typography.headlineSmall)
+                  Spacer(modifier = Modifier.height(10.dp))
 
                   OutlinedTextField(
                       value = url,
@@ -447,7 +489,7 @@ jobs:
                       singleLine = true
                   )
 
-                  Spacer(modifier = Modifier.height(12.dp))
+                  Spacer(modifier = Modifier.height(10.dp))
 
                   Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       Button(
@@ -459,15 +501,15 @@ jobs:
                       }
 
                       OutlinedButton(onClick = { showAuthWebView = !showAuthWebView }) {
-                          Text(if (showAuthWebView) "Hide Login" else "Web Login")
+                          Text(if (showAuthWebView) "Show Gallery" else "Web Login")
                       }
                   }
 
-                  Spacer(modifier = Modifier.height(12.dp))
+                  Spacer(modifier = Modifier.height(8.dp))
                   Text(statusText, style = MaterialTheme.typography.bodyMedium)
+                  Spacer(modifier = Modifier.height(10.dp))
 
                   if (showAuthWebView) {
-                      Spacer(modifier = Modifier.height(12.dp))
                       Button(
                           onClick = {
                               val count = CookieBridge.exportToNetscapeFile(url, cookieFile)
@@ -489,7 +531,7 @@ jobs:
                                       ViewGroup.LayoutParams.MATCH_PARENT,
                                       ViewGroup.LayoutParams.MATCH_PARENT
                                   )
-                                  setBackgroundColor(Color.WHITE)
+                                  setBackgroundColor(AndroidColor.WHITE)
                                   settings.javaScriptEnabled = true
                                   settings.domStorageEnabled = true
                                   settings.databaseEnabled = true
@@ -509,6 +551,195 @@ jobs:
                               }
                           }
                       )
+                  } else {
+                      Row(
+                          modifier = Modifier.fillMaxWidth(),
+                          horizontalArrangement = Arrangement.SpaceBetween,
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Text(
+                              "Downloaded Media (${mediaFiles.size})",
+                              style = MaterialTheme.typography.titleMedium
+                          )
+                          TextButton(onClick = { refreshGallery() }) {
+                              Text("Refresh")
+                          }
+                      }
+
+                      if (mediaFiles.isEmpty()) {
+                          Box(
+                              modifier = Modifier.fillMaxWidth().weight(1f),
+                              contentAlignment = Alignment.Center
+                          ) {
+                              Text("No downloaded media yet. Share a link to start!")
+                          }
+                      } else {
+                          LazyVerticalGrid(
+                              columns = GridCells.Fixed(3),
+                              modifier = Modifier.fillMaxWidth().weight(1f),
+                              horizontalArrangement = Arrangement.spacedBy(6.dp),
+                              verticalArrangement = Arrangement.spacedBy(6.dp)
+                          ) {
+                              items(mediaFiles, key = { it.absolutePath }) { file ->
+                                  MediaThumbnailItem(
+                                      file = file,
+                                      onClick = { selectedFile = file }
+                                  )
+                              }
+                          }
+                      }
+                  }
+              }
+
+              selectedFile?.let { file ->
+                  FullScreenMediaViewer(
+                      file = file,
+                      onDismiss = { selectedFile = null },
+                      onDelete = {
+                          file.delete()
+                          selectedFile = null
+                          refreshGallery()
+                      }
+                  )
+              }
+          }
+
+          @Composable
+          fun MediaThumbnailItem(file: File, onClick: () -> Unit) {
+              var bitmap by remember(file.absolutePath) { mutableStateOf<Bitmap?>(null) }
+              val isVideo = remember(file.absolutePath) { isVideoFile(file) }
+
+              LaunchedEffect(file.absolutePath) {
+                  bitmap = withContext(Dispatchers.IO) {
+                      runCatching {
+                          if (isVideo) {
+                              val retriever = MediaMetadataRetriever()
+                              retriever.setDataSource(file.absolutePath)
+                              val frame = retriever.getFrameAtTime(1000000L) ?: retriever.frameAtTime
+                              retriever.release()
+                              frame?.let { ThumbnailUtils.extractThumbnail(it, 320, 320) }
+                          } else {
+                              val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                              BitmapFactory.decodeFile(file.absolutePath, opts)
+                              var sampleSize = 1
+                              while (opts.outWidth / sampleSize > 360 || opts.outHeight / sampleSize > 360) {
+                                  sampleSize *= 2
+                              }
+                              val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                              BitmapFactory.decodeFile(file.absolutePath, decodeOpts)
+                          }
+                      }.getOrNull()
+                  }
+              }
+
+              Box(
+                  modifier = Modifier
+                      .aspectRatio(1f)
+                      .clip(RoundedCornerShape(8.dp))
+                      .background(Color(0xFF2B2B2B))
+                      .clickable { onClick() },
+                  contentAlignment = Alignment.Center
+              ) {
+                  bitmap?.let { bmp ->
+                      Image(
+                          bitmap = bmp.asImageBitmap(),
+                          contentDescription = file.name,
+                          contentScale = ContentScale.Crop,
+                          modifier = Modifier.fillMaxSize()
+                      )
+                  } ?: Text(
+                      text = file.extension.uppercase(),
+                      style = MaterialTheme.typography.labelMedium
+                  )
+
+                  if (isVideo) {
+                      Box(
+                          modifier = Modifier
+                              .align(Alignment.BottomEnd)
+                              .padding(4.dp)
+                              .background(Color(0xAA000000), RoundedCornerShape(4.dp))
+                              .padding(horizontal = 6.dp, vertical = 2.dp)
+                      ) {
+                          Text("▶ VIDEO", style = MaterialTheme.typography.labelSmall, color = Color.White)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun FullScreenMediaViewer(file: File, onDismiss: () -> Unit, onDelete: () -> Unit) {
+              val isVideo = remember(file.absolutePath) { isVideoFile(file) }
+              var fullBitmap by remember(file.absolutePath) { mutableStateOf<Bitmap?>(null) }
+
+              LaunchedEffect(file.absolutePath) {
+                  if (!isVideo) {
+                      fullBitmap = withContext(Dispatchers.IO) {
+                          runCatching { BitmapFactory.decodeFile(file.absolutePath) }.getOrNull()
+                      }
+                  }
+              }
+
+              Dialog(
+                  onDismissRequest = onDismiss,
+                  properties = DialogProperties(usePlatformDefaultWidth = false)
+              ) {
+                  Box(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .background(Color.Black)
+                  ) {
+                      if (isVideo) {
+                          AndroidView(
+                              modifier = Modifier.fillMaxSize(),
+                              factory = { ctx ->
+                                  VideoView(ctx).apply {
+                                      setVideoURI(Uri.fromFile(file))
+                                      val mediaController = MediaController(ctx)
+                                      mediaController.setAnchorView(this)
+                                      setMediaController(mediaController)
+                                      setOnPreparedListener { mp ->
+                                          mp.isLooping = true
+                                          start()
+                                      }
+                                  }
+                              }
+                          )
+                      } else {
+                          fullBitmap?.let { bmp ->
+                              Image(
+                                  bitmap = bmp.asImageBitmap(),
+                                  contentDescription = file.name,
+                                  contentScale = ContentScale.Fit,
+                                  modifier = Modifier.fillMaxSize()
+                              )
+                          }
+                      }
+
+                      Row(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .align(Alignment.TopCenter)
+                              .background(Color(0x99000000))
+                              .padding(12.dp),
+                          horizontalArrangement = Arrangement.SpaceBetween,
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Text(
+                              text = file.name,
+                              color = Color.White,
+                              maxLines = 1,
+                              overflow = TextOverflow.Ellipsis,
+                              modifier = Modifier.weight(1f).padding(end = 8.dp)
+                          )
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              OutlinedButton(onClick = onDelete) {
+                                  Text("Delete", color = Color(0xFFFF6B6B))
+                              }
+                              Button(onClick = onDismiss) {
+                                  Text("Close")
+                              }
+                          }
+                      }
                   }
               }
           }
@@ -539,5 +770,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: OmniGrab-v1.3-apk
+          name: OmniGrab-v1.4-apk
           path: app/build/outputs/apk/debug/app-debug.apk
